@@ -5,7 +5,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
 
-/// UUID Service & Characteristic BLE standar untuk IoT LoudSound (ESP32 DETEKSI_KEBISINGAN_IOT.ino)
+/// UUID Service & Characteristic BLE untuk IoT LoudSound (ESP32 DETEKSI_KEBISINGAN_IOT.ino)
 class BleUuids {
   // Service UUID utama dari DETEKSI_KEBISINGAN_IOT.ino
   static final Guid serviceUuid =
@@ -15,21 +15,76 @@ class BleUuids {
   static final Guid legacyServiceUuid =
       Guid('4fafc201-1fb5-459e-8fcc-c5c9c331914b');
 
-  // Characteristic UUID telemetri suara utama dari DETEKSI_KEBISINGAN_IOT.ino (Read/Notify)
+  // Characteristic telemetri suara utama (Read/Notify)
   static final Guid decibelCharacteristicUuid =
       Guid('beb5483e-36e1-4688-b7f5-ea07361b26a8');
 
-  // Characteristic UUID cadangan
+  // Characteristic telemetri cadangan (firmware legacy)
   static final Guid altDecibelCharacteristicUuid =
       Guid('beb5483e-36e1-4688-b7f5-ea07361b26aa');
 
-  // Characteristic untuk konfigurasi Wi-Fi jika didukung perangkat
+  // Characteristic konfigurasi Wi-Fi (Write) - kredensial dikirim app ke ESP32
   static final Guid wifiConfigCharacteristicUuid =
-      Guid('beb5483e-36e1-4688-b7f5-ea07361b26a8');
+      Guid('beb5483e-36e1-4688-b7f5-ea07361b26b1');
 
-  // Characteristic status Wi-Fi
+  // Characteristic status Wi-Fi (Read/Notify) - hasil koneksi dikirim ESP32 ke app
   static final Guid wifiStatusCharacteristicUuid =
+      Guid('beb5483e-36e1-4688-b7f5-ea07361b26b2');
+
+  // Status Wi-Fi pada firmware legacy (lib/esp32_loudsound_ble_wifi.ino)
+  static final Guid legacyWifiStatusCharacteristicUuid =
       Guid('beb5483e-36e1-4688-b7f5-ea07361b26a9');
+}
+
+/// Konstanta kalibrasi suara. Harus selaras dengan firmware ESP32
+/// (mikrofon INMP441: -26 dBFS @ 94 dB SPL).
+abstract final class SoundCalibration {
+  /// dB SPL acuan saat sensitivitas mikrofon diukur.
+  static const double refDb = 94.0;
+
+  /// Batas bawah/atas dB SPL yang valid untuk mikrofon INMP441.
+  static const double minDb = 30.0;
+  static const double maxDb = 120.0;
+
+  /// Ambang "TERLALU BERISIK" (sama dengan firmware & NoiseLevel.loud).
+  static const double loudThresholdDb = 85.0;
+
+  /// Nilai RMS firmware LAMA (RMS 24-bit / 10000) pada 94 dB SPL.
+  /// = 10^(-26/20) * 2^23 / sqrt(2) / 10000
+  static const double legacyRmsAtRefDb = 29.7284;
+
+  static const String statusLoud = 'TERLALU BERISIK';
+  static const String statusNormal = 'NORMAL';
+
+  /// Konversi RMS skala firmware lama menjadi dB SPL terkalibrasi.
+  static double legacyRmsToDb(double scaledRms) {
+    if (scaledRms <= 0) return minDb;
+    final db = refDb + 20.0 * (math.log(scaledRms / legacyRmsAtRefDb) / math.ln10);
+    return db.clamp(minDb, maxDb).toDouble();
+  }
+
+  /// dB SPL -> tekanan suara RMS dalam Pascal (p = 20 µPa * 10^(dB/20)).
+  static double dbToPascal(double db) {
+    return math.pow(10.0, (db - refDb) / 20.0).toDouble();
+  }
+}
+
+/// Hasil parsing satu paket telemetri dari ESP32.
+class TelemetrySample {
+  const TelemetrySample({
+    required this.db,
+    required this.rms,
+    required this.status,
+  });
+
+  /// Tingkat suara terkalibrasi (dB SPL).
+  final double db;
+
+  /// Tekanan suara RMS dalam Pascal.
+  final double rms;
+
+  /// Status alarm ('NORMAL' / 'TERLALU BERISIK').
+  final String status;
 }
 
 enum BleDeviceConnectionState {
@@ -43,11 +98,13 @@ class DiscoveredIotDevice {
   final BluetoothDevice device;
   final String name;
   final int rssi;
+  final bool isLikelyIot;
 
   DiscoveredIotDevice({
     required this.device,
     required this.name,
     required this.rssi,
+    this.isLikelyIot = false,
   });
 }
 
@@ -70,41 +127,100 @@ class BleIotService with ChangeNotifier {
   List<DiscoveredIotDevice> get discoveredDevices =>
       List.unmodifiable(_discoveredDevices);
 
+  /// Pesan kesalahan terakhir (izin ditolak, Bluetooth mati, dsb.) untuk UI.
+  String? _lastError;
+  String? get lastError => _lastError;
+
   String? _connectedWifiSsid;
   String? get connectedWifiSsid => _connectedWifiSsid;
 
   String _iotWifiStatus = 'Belum terhubung ke Wi-Fi';
   String get iotWifiStatus => _iotWifiStatus;
 
+  /// Tekanan suara RMS (Pascal).
   double? _latestRms;
   double? get latestRms => _latestRms;
 
+  /// Tingkat suara terkalibrasi (dB SPL).
   double? _latestDecibels;
   double? get latestDecibels => _latestDecibels;
 
   String? _latestStatus;
   String? get latestStatus => _latestStatus;
 
-  /// Konversi nilai RMS ke Desibel (dB)
-  static double convertRmsToDb(double rms) {
-    if (rms <= 0.00001) return 30.0;
-    // Skala RMS dari DETEKSI_KEBISINGAN_IOT.ino (sekitar 30 - 150)
-    // Nilai ini setara dengan intensitas kebisingan (Threshold Normal: 70, Loud: 120)
-    if (rms >= 20.0) {
-      return rms.clamp(30.0, 130.0);
-    }
-    // Jika data berupa tegangan volt mentah (< 3.3V)
-    double vRms = rms;
-    if (vRms > 3.3) {
-      vRms = (vRms / 4095.0) * 3.3;
-    }
-    final db = 20.0 * (math.log(vRms / 0.00005) / math.ln10);
-    return db.clamp(30.0, 130.0);
-  }
+  bool get isLoudNow => _latestStatus == SoundCalibration.statusLoud;
 
-  /// Konversi Desibel (dB) ke nilai RMS
-  static double convertDbToRms(double db) {
-    return db;
+  /// Mengurai payload telemetri dari ESP32 menjadi dB SPL terkalibrasi.
+  ///
+  /// Format yang didukung:
+  ///  - JSON baru  : {"db":74.3,"rms":0.01234,"status":"NORMAL"}
+  ///  - JSON lama  : {"rms":74.2,"status":"NORMAL"}  (skala RMS lama, dikonversi)
+  ///  - JSON TERPOTONG (MTU kecil) -> field diambil dengan regex
+  ///  - "DB:68.5", "RMS:74.2", atau angka tunggal (dianggap dB)
+  @visibleForTesting
+  static TelemetrySample? parseTelemetry(String raw) {
+    final text = raw.trim();
+    if (text.isEmpty) return null;
+
+    double? db;
+    double? legacyRms;
+    String? status;
+
+    double? numberFor(String key) {
+      final m = RegExp('"$key"\\s*:\\s*(-?\\d+(?:\\.\\d+)?)').firstMatch(text);
+      return m == null ? null : double.tryParse(m.group(1)!);
+    }
+
+    if (text.startsWith('{')) {
+      var decoded = false;
+      if (text.endsWith('}')) {
+        try {
+          final json = jsonDecode(text);
+          if (json is Map<String, dynamic>) {
+            decoded = true;
+            if (json['db'] is num) db = (json['db'] as num).toDouble();
+            if (json['rms'] is num) legacyRms = (json['rms'] as num).toDouble();
+            if (json['status'] != null) status = json['status'].toString();
+          }
+        } catch (_) {}
+      }
+      if (!decoded) {
+        // Payload terpotong: selamatkan field yang masih utuh.
+        db = numberFor('db');
+        legacyRms = numberFor('rms');
+        status = RegExp('"status"\\s*:\\s*"([^"]*)"').firstMatch(text)?.group(1);
+      }
+    } else {
+      final upper = text.toUpperCase();
+      if (upper.startsWith('DB:')) {
+        db = double.tryParse(text.substring(3).trim());
+      } else if (upper.startsWith('RMS:')) {
+        legacyRms = double.tryParse(text.substring(4).trim());
+      } else {
+        db = double.tryParse(text);
+      }
+    }
+
+    final double finalDb;
+    if (db != null) {
+      finalDb = db.clamp(SoundCalibration.minDb, SoundCalibration.maxDb).toDouble();
+    } else if (legacyRms != null) {
+      finalDb = SoundCalibration.legacyRmsToDb(legacyRms);
+    } else {
+      return null;
+    }
+
+    final resolvedStatus = (status != null && status.isNotEmpty)
+        ? status
+        : (finalDb >= SoundCalibration.loudThresholdDb
+            ? SoundCalibration.statusLoud
+            : SoundCalibration.statusNormal);
+
+    return TelemetrySample(
+      db: finalDb,
+      rms: SoundCalibration.dbToPascal(finalDb),
+      status: resolvedStatus,
+    );
   }
 
   int _readingTick = 0;
@@ -124,58 +240,53 @@ class BleIotService with ChangeNotifier {
     return dev.platformName.isNotEmpty ? dev.platformName : dev.remoteId.str;
   }
 
-  /// Menghubungkan perangkat demo/simulasi sesuai konfigurasi DETEKSI_KEBISINGAN_IOT.ino
+  /// Menghubungkan perangkat demo/simulasi
   void connectDemoDevice({String name = 'Noise_Monitor'}) {
-    disconnect();
+    unawaited(disconnect());
     _isMockDevice = true;
     _mockDeviceName = name;
     _connectionState = BleDeviceConnectionState.connected;
     _iotWifiStatus = 'BLE Terhubung (Sensor I2S Aktif)';
     _connectedWifiSsid = null;
 
-    // Inisialisasi awal
-    _latestDecibels = 68.4;
-    _latestRms = 68.4;
-    _latestStatus = 'NORMAL';
-    _readingTick++;
-    notifyListeners();
+    _applySample(const TelemetrySample(
+      db: 58.4,
+      rms: 0.0017,
+      status: SoundCalibration.statusNormal,
+    ));
 
     _mockSensorTimer?.cancel();
-    // Mensimulasikan ESP32 yang mengirim sampel data setiap 1000ms (INTERVAL = 1000 pada sketch)
+    // Mensimulasikan ESP32 yang mengirim telemetri realtime setiap 250 ms
     _mockSensorTimer =
-        Timer.periodic(const Duration(milliseconds: 1000), (timer) {
+        Timer.periodic(const Duration(milliseconds: 250), (timer) {
       if (_connectionState != BleDeviceConnectionState.connected ||
           !_isMockDevice) {
         timer.cancel();
         return;
       }
       final tick = timer.tick;
-      final base = 65.0 + math.sin(tick * 0.28) * 18.0;
-      final noise = (math.Random().nextDouble() - 0.5) * 8.0;
-      final spike = (tick % 12 == 0) ? 44.0 : 0.0;
-      final rms = (base + noise + spike).clamp(32.0, 135.0);
-      final isLoud = rms >= 120.0; // THRESHOLD_HIGH pada sketch ESP32
+      final base = 62.0 + math.sin(tick * 0.07) * 14.0;
+      final noise = (math.Random().nextDouble() - 0.5) * 6.0;
+      final spike = (tick % 60 < 8) ? 26.0 : 0.0;
+      final db = (base + noise + spike)
+          .clamp(SoundCalibration.minDb, SoundCalibration.maxDb)
+          .toDouble();
+      final loud = db >= SoundCalibration.loudThresholdDb;
 
-      _latestRms = double.parse(rms.toStringAsFixed(1));
-      _latestDecibels = _latestRms;
-      _latestStatus = isLoud ? 'TERLALU BERISIK' : 'NORMAL';
-      _readingTick++;
-      notifyListeners();
+      _applySample(TelemetrySample(
+        db: double.parse(db.toStringAsFixed(1)),
+        rms: SoundCalibration.dbToPascal(db),
+        status: loud
+            ? SoundCalibration.statusLoud
+            : SoundCalibration.statusNormal,
+      ));
     });
   }
 
-  /// Memperbarui nilai suara secara manual (berguna untuk testing/simulasi)
-  void updateSoundData({double? rms, double? decibels, String? status}) {
-    if (status != null) {
-      _latestStatus = status;
-    }
-    if (rms != null) {
-      _latestRms = rms;
-      _latestDecibels = decibels ?? convertRmsToDb(rms);
-    } else if (decibels != null) {
-      _latestDecibels = decibels;
-      _latestRms = convertDbToRms(decibels);
-    }
+  void _applySample(TelemetrySample sample) {
+    _latestDecibels = sample.db;
+    _latestRms = sample.rms;
+    _latestStatus = sample.status;
     _readingTick++;
     notifyListeners();
   }
@@ -194,33 +305,85 @@ class BleIotService with ChangeNotifier {
   BluetoothCharacteristic? get wifiStatusChar => _wifiStatusChar;
   BluetoothCharacteristic? get decibelChar => _decibelChar;
 
-  /// Meminta izin Bluetooth & Lokasi (wajib untuk Android 12+)
+  /// True bila firmware perangkat menyediakan karakteristik konfigurasi Wi-Fi.
+  bool get supportsWifiProvisioning => _wifiConfigChar != null;
+
+  /// True bila karakteristik telemetri suara ditemukan.
+  bool get hasTelemetry => _decibelChar != null;
+
+  /// Meminta izin yang dibutuhkan: hanya Bluetooth ("Perangkat sekitar") + Wi-Fi.
+  ///
+  /// - Android 12+ : BLUETOOTH_SCAN (neverForLocation) + BLUETOOTH_CONNECT +
+  ///   NEARBY_WIFI_DEVICES (Android 13+). TIDAK memerlukan izin lokasi/GPS.
+  /// - Android 11-: izin lokasi diminta otomatis oleh flutter_blue_plus saat scan
+  ///   (batasan sistem Android untuk BLE versi lama).
   Future<bool> requestPermissions() async {
-    if (kIsWeb) return false;
+    if (kIsWeb) {
+      _lastError = 'Bluetooth tidak didukung di web.';
+      return false;
+    }
 
     if (defaultTargetPlatform == TargetPlatform.android) {
       final statuses = await [
         Permission.bluetoothScan,
         Permission.bluetoothConnect,
-        Permission.location,
+        Permission.nearbyWifiDevices,
       ].request();
 
-      final scanGranted = statuses[Permission.bluetoothScan]?.isGranted ?? true;
-      final connGranted =
-          statuses[Permission.bluetoothConnect]?.isGranted ?? true;
-      final locGranted = statuses[Permission.location]?.isGranted ?? true;
+      final scan = statuses[Permission.bluetoothScan];
+      final conn = statuses[Permission.bluetoothConnect];
 
-      return (scanGranted && connGranted) || locGranted;
+      final scanOk = scan?.isGranted ?? true;
+      final connOk = conn?.isGranted ?? true;
+
+      if (!scanOk || !connOk) {
+        final permanent = (scan?.isPermanentlyDenied ?? false) ||
+            (conn?.isPermanentlyDenied ?? false);
+        _lastError = permanent
+            ? 'Izin "Perangkat sekitar" (Bluetooth) ditolak permanen. Aktifkan lewat Pengaturan > Aplikasi > LoudSound > Izin.'
+            : 'Izin "Perangkat sekitar" (Bluetooth) diperlukan untuk mencari perangkat IoT.';
+        return false;
+      }
     }
 
     return true;
   }
 
+  /// Memastikan adapter Bluetooth menyala (Android akan menampilkan dialog sistem).
+  Future<bool> _ensureBluetoothOn() async {
+    try {
+      var state = await FlutterBluePlus.adapterState
+          .firstWhere((s) => s != BluetoothAdapterState.unknown)
+          .timeout(const Duration(seconds: 3));
+      if (state == BluetoothAdapterState.on) return true;
+
+      if (defaultTargetPlatform == TargetPlatform.android) {
+        try {
+          await FlutterBluePlus.turnOn();
+        } catch (_) {}
+        state = await FlutterBluePlus.adapterState
+            .firstWhere((s) => s == BluetoothAdapterState.on)
+            .timeout(const Duration(seconds: 6));
+        return state == BluetoothAdapterState.on;
+      }
+    } catch (_) {}
+    return false;
+  }
+
   /// Memulai pemindaian perangkat BLE terdekat
   Future<void> startScan({Duration timeout = const Duration(seconds: 10)}) async {
+    _lastError = null;
+
     final hasPermission = await requestPermissions();
     if (!hasPermission) {
       debugPrint('[BLE] Izin Bluetooth ditolak pengguna.');
+      notifyListeners();
+      return;
+    }
+
+    if (!await _ensureBluetoothOn()) {
+      _lastError = 'Bluetooth belum aktif. Nyalakan Bluetooth lalu pindai ulang.';
+      notifyListeners();
       return;
     }
 
@@ -230,32 +393,43 @@ class BleIotService with ChangeNotifier {
     _scanSub?.cancel();
     _scanSub = FlutterBluePlus.scanResults.listen((results) {
       for (final r in results) {
-        final name = r.advertisementData.advName.isNotEmpty
-            ? r.advertisementData.advName
-            : (r.device.platformName.isNotEmpty
-                ? r.device.platformName
-                : 'Perangkat Tanpa Nama');
+        final advName = r.advertisementData.advName;
+        final platformName = r.device.platformName;
+        final name = advName.isNotEmpty ? advName : platformName;
+
+        final advertisesService = r.advertisementData.serviceUuids.any(
+          (u) => u == BleUuids.serviceUuid || u == BleUuids.legacyServiceUuid,
+        );
+        final lowerName = name.toLowerCase();
+        final isIot = advertisesService ||
+            lowerName.contains('noise_monitor') ||
+            lowerName.contains('loudsound');
+
+        // Sembunyikan perangkat BLE anonim di sekitar kecuali itu perangkat IoT kita.
+        if (name.isEmpty && !isIot) continue;
+
+        final item = DiscoveredIotDevice(
+          device: r.device,
+          name: name.isEmpty ? 'Perangkat Tanpa Nama' : name,
+          rssi: r.rssi,
+          isLikelyIot: isIot,
+        );
 
         final existingIdx = _discoveredDevices.indexWhere(
           (d) => d.device.remoteId == r.device.remoteId,
         );
-
         if (existingIdx >= 0) {
-          _discoveredDevices[existingIdx] = DiscoveredIotDevice(
-            device: r.device,
-            name: name,
-            rssi: r.rssi,
-          );
+          _discoveredDevices[existingIdx] = item;
         } else {
-          _discoveredDevices.add(
-            DiscoveredIotDevice(
-              device: r.device,
-              name: name,
-              rssi: r.rssi,
-            ),
-          );
+          _discoveredDevices.add(item);
         }
       }
+
+      // Perangkat IoT di atas, lalu urut sinyal terkuat.
+      _discoveredDevices.sort((a, b) {
+        if (a.isLikelyIot != b.isLikelyIot) return a.isLikelyIot ? -1 : 1;
+        return b.rssi.compareTo(a.rssi);
+      });
       notifyListeners();
     });
 
@@ -266,9 +440,14 @@ class BleIotService with ChangeNotifier {
     });
 
     try {
-      await FlutterBluePlus.startScan(timeout: timeout);
+      await FlutterBluePlus.startScan(
+        timeout: timeout,
+        // Tidak memakai lokasi: BLUETOOTH_SCAN dideklarasikan neverForLocation.
+        androidUsesFineLocation: false,
+      );
     } catch (e) {
       debugPrint('[BLE] Gagal startScan: $e');
+      _lastError = 'Gagal memindai perangkat: $e';
       _isScanning = false;
       notifyListeners();
     }
@@ -286,6 +465,7 @@ class BleIotService with ChangeNotifier {
   /// Menghubungkan ke perangkat IoT BLE
   Future<bool> connectToDevice(BluetoothDevice device) async {
     await stopScan();
+    _lastError = null;
 
     _connectionState = BleDeviceConnectionState.connecting;
     _connectedDevice = device;
@@ -294,30 +474,36 @@ class BleIotService with ChangeNotifier {
     try {
       _deviceConnSub?.cancel();
       _deviceConnSub = device.connectionState.listen((state) {
-        if (state == BluetoothConnectionState.connected) {
-          _connectionState = BleDeviceConnectionState.connected;
-        } else if (state == BluetoothConnectionState.disconnected) {
+        if (state == BluetoothConnectionState.disconnected &&
+            _connectionState != BleDeviceConnectionState.connecting) {
           _connectionState = BleDeviceConnectionState.disconnected;
           _cleanupCharacteristics();
+          notifyListeners();
         }
-        notifyListeners();
       });
 
       await device.connect(
         timeout: const Duration(seconds: 15),
         autoConnect: false,
+        // Minta MTU besar (Android) agar payload JSON tidak terpotong.
+        mtu: 247,
       );
+
+      // Temukan Service dan Characteristic SEBELUM dianggap "terhubung"
+      // supaya UI tidak menampilkan "Menunggu data" tanpa langganan notifikasi.
+      await _discoverServices(device);
 
       _connectionState = BleDeviceConnectionState.connected;
       notifyListeners();
-
-      // Temukan Service dan Characteristic
-      await _discoverServices(device);
       return true;
     } catch (e) {
       debugPrint('[BLE] Gagal terhubung ke device: $e');
+      _lastError = 'Gagal terhubung: $e';
       _connectionState = BleDeviceConnectionState.disconnected;
       _cleanupCharacteristics();
+      try {
+        await device.disconnect();
+      } catch (_) {}
       notifyListeners();
       return false;
     }
@@ -325,106 +511,112 @@ class BleIotService with ChangeNotifier {
 
   /// Menemukan GATT Services & Characteristics IoT
   Future<void> _discoverServices(BluetoothDevice device) async {
-    try {
-      final services = await device.discoverServices();
-      for (final service in services) {
-        for (final char in service.characteristics) {
-          // 1. Cek characteristic telemetri suara dari DETEKSI_KEBISINGAN_IOT.ino (beb5483e-36e1-4688-b7f5-ea07361b26a8)
-          if (char.uuid == BleUuids.decibelCharacteristicUuid ||
-              char.uuid == BleUuids.altDecibelCharacteristicUuid ||
-              char.properties.notify) {
-            _decibelChar = char;
-            await _subscribeToDecibels(char);
-          }
+    _cleanupCharacteristics();
 
-          // 2. Cek characteristic Wi-Fi config (jika perangkat mendukung penulisan kredensial)
-          if (char.properties.write || char.properties.writeWithoutResponse) {
-            _wifiConfigChar ??= char;
-          }
+    final services = await device.discoverServices();
 
-          // 3. Cek characteristic status Wi-Fi
-          if (char.uuid == BleUuids.wifiStatusCharacteristicUuid) {
-            _wifiStatusChar = char;
-            await _subscribeToWifiStatus(char);
-          }
+    BluetoothCharacteristic? telemetry;
+    BluetoothCharacteristic? wifiConfig;
+    BluetoothCharacteristic? wifiStatus;
+    BluetoothCharacteristic? telemetryFallback;
+    BluetoothCharacteristic? wifiConfigFallback;
+
+    for (final service in services) {
+      // Abaikan service GATT bawaan Android (Generic Access/Attribute, dsb.)
+      final isGenericService = service.uuid.str128.startsWith('00001800') ||
+          service.uuid.str128.startsWith('00001801');
+      if (isGenericService) continue;
+
+      for (final char in service.characteristics) {
+        final props = char.properties;
+        final uuid = char.uuid;
+
+        if (uuid == BleUuids.wifiStatusCharacteristicUuid ||
+            uuid == BleUuids.legacyWifiStatusCharacteristicUuid) {
+          wifiStatus ??= char;
+        } else if (uuid == BleUuids.wifiConfigCharacteristicUuid) {
+          wifiConfig ??= char;
+        } else if ((uuid == BleUuids.decibelCharacteristicUuid ||
+                uuid == BleUuids.altDecibelCharacteristicUuid) &&
+            (props.notify || props.indicate)) {
+          telemetry ??= char;
+        } else if (props.notify || props.indicate) {
+          telemetryFallback ??= char;
+        } else if (props.write || props.writeWithoutResponse) {
+          wifiConfigFallback ??= char;
         }
       }
-      notifyListeners();
-    } catch (e) {
-      debugPrint('[BLE] Gagal discoverServices: $e');
     }
+
+    _decibelChar = telemetry ?? telemetryFallback;
+    _wifiConfigChar = wifiConfig ?? wifiConfigFallback;
+    _wifiStatusChar = wifiStatus;
+
+    if (_decibelChar != null) {
+      await _subscribeToDecibels(device, _decibelChar!);
+    } else {
+      debugPrint('[BLE] Characteristic telemetri suara tidak ditemukan');
+    }
+    if (_wifiStatusChar != null) {
+      await _subscribeToWifiStatus(device, _wifiStatusChar!);
+    }
+
+    notifyListeners();
   }
 
-  Future<void> _subscribeToWifiStatus(BluetoothCharacteristic char) async {
+  Future<void> _subscribeToWifiStatus(
+    BluetoothDevice device,
+    BluetoothCharacteristic char,
+  ) async {
     try {
-      await char.setNotifyValue(true);
       _wifiStatusSub?.cancel();
-      _wifiStatusSub = char.onValueReceived.listen((data) {
-        final statusText = utf8.decode(data, allowMalformed: true).trim();
-        if (statusText.isNotEmpty) {
-          _iotWifiStatus = statusText;
-          notifyListeners();
-        }
-      });
+      _wifiStatusSub = char.onValueReceived.listen(_handleWifiStatusBytes);
+      device.cancelWhenDisconnected(_wifiStatusSub!);
+
+      await char.setNotifyValue(true);
+
+      // Baca status awal supaya UI langsung sinkron
+      if (char.properties.read) {
+        _handleWifiStatusBytes(await char.read());
+      }
     } catch (e) {
       debugPrint('[BLE] Gagal subscribe ke Wi-Fi status: $e');
     }
   }
 
-  Future<void> _subscribeToDecibels(BluetoothCharacteristic char) async {
+  void _handleWifiStatusBytes(List<int> data) {
+    final statusText = utf8.decode(data, allowMalformed: true).trim();
+    if (statusText.isNotEmpty) {
+      _iotWifiStatus = statusText;
+      notifyListeners();
+    }
+  }
+
+  Future<void> _subscribeToDecibels(
+    BluetoothDevice device,
+    BluetoothCharacteristic char,
+  ) async {
     try {
-      await char.setNotifyValue(true);
       _decibelSub?.cancel();
-      _decibelSub = char.onValueReceived.listen((data) {
-        final text = utf8.decode(data, allowMalformed: true).trim();
-        if (text.isEmpty) return;
+      _decibelSub = char.onValueReceived.listen(_handleTelemetryBytes);
+      device.cancelWhenDisconnected(_decibelSub!);
 
-        double? parsedRms;
-        double? parsedDb;
-        String? parsedStatus;
+      await char.setNotifyValue(true);
 
-        // 1. Coba parse format JSON dari DETEKSI_KEBISINGAN_IOT.ino: {"rms": 74.2, "status": "NORMAL"}
-        if (text.startsWith('{') && text.endsWith('}')) {
-          try {
-            final json = jsonDecode(text) as Map<String, dynamic>;
-            if (json.containsKey('rms')) {
-              parsedRms = (json['rms'] as num).toDouble();
-            }
-            if (json.containsKey('db')) {
-              parsedDb = (json['db'] as num).toDouble();
-            }
-            if (json.containsKey('status')) {
-              parsedStatus = json['status']?.toString();
-            }
-          } catch (_) {}
-        }
-
-        // 2. Cek format key-value, misal "RMS:74.2" atau "DB:68.5"
-        if (parsedRms == null && text.toUpperCase().startsWith('RMS:')) {
-          parsedRms = double.tryParse(text.substring(4).trim());
-        } else if (parsedDb == null && text.toUpperCase().startsWith('DB:')) {
-          parsedDb = double.tryParse(text.substring(3).trim());
-        }
-
-        // 3. Format angka mentah tunggal
-        if (parsedRms == null && parsedDb == null) {
-          final singleNum = double.tryParse(text);
-          if (singleNum != null) {
-            parsedRms = singleNum;
-          }
-        }
-
-        if (parsedRms != null || parsedDb != null) {
-          updateSoundData(
-            rms: parsedRms,
-            decibels: parsedDb,
-            status: parsedStatus,
-          );
-        }
-      });
+      // Baca nilai awal agar tampilan tidak menunggu notifikasi pertama
+      if (char.properties.read) {
+        _handleTelemetryBytes(await char.read());
+      }
     } catch (e) {
       debugPrint('[BLE] Gagal subscribe ke telemetri suara: $e');
     }
+  }
+
+  void _handleTelemetryBytes(List<int> data) {
+    if (data.isEmpty) return;
+    final sample = parseTelemetry(utf8.decode(data, allowMalformed: true));
+    if (sample == null) return;
+    _applySample(sample);
   }
 
   /// Mengirim kredensial Wi-Fi ke perangkat IoT via BLE
@@ -434,12 +626,14 @@ class BleIotService with ChangeNotifier {
   }) async {
     if (_connectionState != BleDeviceConnectionState.connected ||
         _connectedDevice == null) {
-      debugPrint('[BLE] Perangkat belum terhubung');
+      _lastError = 'Perangkat belum terhubung';
       return false;
     }
 
-    if (_wifiConfigChar == null) {
-      debugPrint('[BLE] Characteristic konfigurasi Wi-Fi tidak ditemukan');
+    final char = _wifiConfigChar;
+    if (char == null) {
+      _lastError =
+          'Firmware perangkat belum mendukung pengaturan Wi-Fi. Flash ulang DETEKSI_KEBISINGAN_IOT.ino versi terbaru.';
       return false;
     }
 
@@ -450,17 +644,22 @@ class BleIotService with ChangeNotifier {
       });
 
       final bytes = utf8.encode(payload);
-      await _wifiConfigChar!.write(
+      final useResponse = char.properties.write;
+      await char.write(
         bytes,
-        withoutResponse: !_wifiConfigChar!.properties.write,
+        withoutResponse: !useResponse,
+        // Mengizinkan data > MTU (SSID + password panjang)
+        allowLongWrite: useResponse,
       );
 
       _connectedWifiSsid = ssid;
       _iotWifiStatus = 'Menghubungkan ke $ssid...';
+      _lastError = null;
       notifyListeners();
       return true;
     } catch (e) {
       debugPrint('[BLE] Gagal mengirim kredensial Wi-Fi: $e');
+      _lastError = 'Gagal mengirim kredensial Wi-Fi: $e';
       return false;
     }
   }
@@ -471,21 +670,31 @@ class BleIotService with ChangeNotifier {
     _mockSensorTimer = null;
     _isMockDevice = false;
     _mockDeviceName = null;
-    try {
-      await _connectedDevice?.disconnect();
-    } catch (_) {}
+
+    // Reset state SECARA SINKRON sebelum await, agar tidak menimpa koneksi baru
+    // (mis. connectDemoDevice() yang memanggil disconnect() lalu langsung set state).
+    final device = _connectedDevice;
     _connectedDevice = null;
     _connectionState = BleDeviceConnectionState.disconnected;
     _cleanupCharacteristics();
     notifyListeners();
+
+    try {
+      await device?.disconnect();
+    } catch (_) {}
   }
 
   void _cleanupCharacteristics() {
     _wifiStatusSub?.cancel();
     _decibelSub?.cancel();
+    _wifiStatusSub = null;
+    _decibelSub = null;
     _wifiConfigChar = null;
     _wifiStatusChar = null;
     _decibelChar = null;
+    _latestDecibels = null;
+    _latestRms = null;
+    _latestStatus = null;
   }
 
   @override

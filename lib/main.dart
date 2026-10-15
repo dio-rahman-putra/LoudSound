@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:firebase_core/firebase_core.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -20,11 +21,27 @@ Future<void> main() async {
       systemNavigationBarColor: AppColors.background,
     ),
   );
-  final firebaseOptions = DefaultFirebaseOptions.currentPlatform;
-  if (firebaseOptions != null) {
-    await Firebase.initializeApp(options: firebaseOptions);
-    await FirebaseNotificationService.initialize();
+
+  // Firebase bersifat opsional (hanya untuk push FCM). Notifikasi peringatan
+  // kebisingan dibuat lokal sehingga tetap jalan walau Firebase gagal init.
+  try {
+    final firebaseOptions = DefaultFirebaseOptions.currentPlatform;
+    if (firebaseOptions != null) {
+      await Firebase.initializeApp(options: firebaseOptions);
+    } else if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
+      // Memakai konfigurasi native dari android/app/google-services.json
+      await Firebase.initializeApp();
+    }
+  } catch (e) {
+    debugPrint('[Firebase] Tidak aktif: $e');
   }
+
+  try {
+    await FirebaseNotificationService.initialize();
+  } catch (e) {
+    debugPrint('[Notif] Gagal inisialisasi: $e');
+  }
+
   runApp(const LoudSoundApp());
 }
 
@@ -50,28 +67,27 @@ class SoundDashboardPage extends StatefulWidget {
 }
 
 class _SoundDashboardPageState extends State<SoundDashboardPage> {
-  /// Interval penyegaran:
-  /// - Bar horizontal bawah: 1 detik (realtime per detik agar responsif & enak dilihat)
-  /// - Angka utama dB & RMS di tengah: 2 detik (stabil dan tetap relevan tanpa flicker)
-  static const _barInterval = Duration(seconds: 1);
-  static const _historyLength = 60;
-  static const _staleAfterMissedTicks = 3;
+  /// Tampilan angka & meter diperbarui LANGSUNG setiap paket BLE diterima
+  /// (tanpa timer dan tanpa animasi tween) agar delay minimum.
+  /// Timer ringan di bawah hanya untuk riwayat grafik & deteksi data tertunda.
+  static const _historySampleInterval = Duration(milliseconds: 500);
+  static const _historyLength = 120;
+  static const _staleAfter = Duration(seconds: 3);
+  static const _alertRepeat = Duration(seconds: 30);
 
   final BleIotService _bleService = BleIotService();
   final List<SoundReading> _history = [];
 
-  Timer? _oneSecondTimer;
-  double? _barDb; // Nilai realtime untuk bar horizontal (refresh per 1 detik)
-  double? _shownDb; // Nilai angka desibel tengah (refresh per 2 detik)
-  double? _shownRms; // Nilai angka RMS tengah (refresh per 2 detik)
-  int _secondsCounter = 0;
-  int _committedTick = 0;
-  int _missedTicks = 0;
+  Timer? _sampleTimer;
+  int _seenTick = 0;
+  DateTime? _lastDataAt;
   bool _stale = false;
   bool _showTrend = false;
 
   bool _notificationsEnabled = false;
   bool _requestingNotifications = false;
+  bool _wasLoud = false;
+  DateTime? _lastAlertAt;
   SoundUnit _unit = SoundUnit.db;
 
   bool get _paired =>
@@ -80,18 +96,27 @@ class _SoundDashboardPageState extends State<SoundDashboardPage> {
   @override
   void initState() {
     super.initState();
-    _committedTick = _bleService.readingTick;
+    _seenTick = _bleService.readingTick;
     _bleService.addListener(_onBleUpdate);
     if (_paired) {
-      _startRefresh();
+      if (_bleService.latestDecibels != null) _lastDataAt = DateTime.now();
+      _startSampling();
     }
+    _restoreNotificationState();
   }
 
   @override
   void dispose() {
     _bleService.removeListener(_onBleUpdate);
-    _stopRefresh();
+    _stopSampling();
     super.dispose();
+  }
+
+  /// Jika izin notifikasi sudah diberikan sebelumnya, peringatan langsung aktif.
+  Future<void> _restoreNotificationState() async {
+    final granted = await FirebaseNotificationService.hasPermission();
+    if (!mounted || !granted) return;
+    setState(() => _notificationsEnabled = true);
   }
 
   /// Dipanggil setiap ada perubahan status BLE atau telemetri dari service
@@ -99,107 +124,111 @@ class _SoundDashboardPageState extends State<SoundDashboardPage> {
     if (!mounted) return;
 
     if (_paired) {
-      _startRefresh();
-      // Segera tampilkan pembacaan pertama untuk bar dan angka
-      if (_barDb == null && _bleService.latestDecibels != null) {
-        _barDb = _bleService.latestDecibels;
-      }
-      if (_shownDb == null && _bleService.readingTick != _committedTick) {
-        _commitReading();
+      _startSampling();
+      if (_bleService.readingTick != _seenTick) {
+        _seenTick = _bleService.readingTick;
+        _lastDataAt = DateTime.now();
+        _stale = false;
+        _maybeAlert();
       }
     } else {
-      _stopRefresh();
+      _stopSampling();
     }
     setState(() {});
   }
 
-  /// Memulai timer refresh 1 detik (HANYA saat perangkat IoT sudah ter-pair)
-  void _startRefresh() {
+  void _startSampling() {
     if (!_paired) return;
-    _oneSecondTimer ??= Timer.periodic(_barInterval, _onOneSecondTick);
+    _sampleTimer ??= Timer.periodic(_historySampleInterval, _onSampleTick);
   }
 
-  /// Menghentikan refresh timer dan mereset tampilan jika koneksi IoT terputus
-  void _stopRefresh() {
-    _oneSecondTimer?.cancel();
-    _oneSecondTimer = null;
-    _committedTick = _bleService.readingTick;
-    _barDb = null;
-    _shownDb = null;
-    _shownRms = null;
-    _secondsCounter = 0;
-    _missedTicks = 0;
+  /// Menghentikan timer dan mereset tampilan jika koneksi IoT terputus
+  void _stopSampling() {
+    _sampleTimer?.cancel();
+    _sampleTimer = null;
+    _seenTick = _bleService.readingTick;
+    _lastDataAt = null;
     _stale = false;
+    _wasLoud = false;
     _history.clear();
   }
 
-  /// Mengambil sampel data sensor terbaru untuk angka tengah (dB & RMS)
-  void _commitReading() {
-    final db = _bleService.latestDecibels;
-    final rms = _bleService.latestRms;
-    if (db == null || rms == null) return;
-
-    _committedTick = _bleService.readingTick;
-    _missedTicks = 0;
-    _stale = false;
-    _shownDb = db;
-    _shownRms = rms;
-    _history.add(SoundReading(db, rms));
-    if (_history.length > _historyLength) {
-      _history.removeAt(0);
-    }
-  }
-
-  /// Callback tiap 1 detik:
-  /// - Bar bawah diperbarui SETIAP 1 DETIK (Realtime & responsif)
-  /// - Angka tengah dB & RMS diperbarui SETIAP 2 DETIK (Stabil)
-  void _onOneSecondTick(Timer timer) {
+  /// Menyimpan sampel ke riwayat grafik & mengecek data tertunda.
+  void _onSampleTick(Timer timer) {
     if (!mounted) return;
 
-    // Pastikan kondisi: perangkat IoT WAJIB sudah ke-pair
     if (!_paired) {
-      setState(_stopRefresh);
+      setState(_stopSampling);
       return;
     }
 
-    _secondsCounter++;
+    final db = _bleService.latestDecibels;
+    final rms = _bleService.latestRms;
+    final lastAt = _lastDataAt;
 
     setState(() {
-      // 1. Perbarui Bar Spektrum Bawah (SETIAP 1 DETIK)
-      final currentDb = _bleService.latestDecibels;
-      if (currentDb != null) {
-        _barDb = currentDb;
-      }
+      _stale = lastAt != null &&
+          DateTime.now().difference(lastAt) > _staleAfter;
 
-      // 2. Perbarui Angka Utama dB & RMS di Tengah (SETIAP 2 DETIK)
-      if (_secondsCounter % 2 == 0) {
-        if (_bleService.readingTick != _committedTick) {
-          _commitReading();
-        } else if (_shownDb != null) {
-          _missedTicks++;
-          if (_missedTicks >= _staleAfterMissedTicks) {
-            _stale = true;
-          }
+      if (!_stale && db != null && rms != null && lastAt != null) {
+        _history.add(SoundReading(db, rms));
+        if (_history.length > _historyLength) {
+          _history.removeAt(0);
         }
       }
     });
   }
 
+  /// Kirim notifikasi saat suara melewati ambang (sekali saat mulai berisik,
+  /// lalu diulang tiap 30 detik selama masih berisik).
+  void _maybeAlert() {
+    final db = _bleService.latestDecibels;
+    final loud = _bleService.isLoudNow ||
+        (db != null && db >= SoundCalibration.loudThresholdDb);
+
+    if (!loud) {
+      _wasLoud = false;
+      return;
+    }
+
+    final now = DateTime.now();
+    final lastAlert = _lastAlertAt;
+    final shouldNotify = !_wasLoud ||
+        (lastAlert != null && now.difference(lastAlert) >= _alertRepeat);
+    _wasLoud = true;
+
+    if (!_notificationsEnabled || !shouldNotify) return;
+
+    _lastAlertAt = now;
+    FirebaseNotificationService.showNoiseAlert(
+      db: db ?? SoundCalibration.loudThresholdDb,
+    );
+  }
+
   HeroStatus get _heroStatus {
     if (!_paired) return HeroStatus.offline;
-    if (_shownDb == null) return HeroStatus.waiting;
+    if (_bleService.latestDecibels == null) return HeroStatus.waiting;
     return _stale ? HeroStatus.stale : HeroStatus.live;
   }
 
   String get _historySpanLabel {
     if (_history.length < 2) return '—';
-    final seconds = (_history.length - 1) * 2;
+    final seconds =
+        ((_history.length - 1) * _historySampleInterval.inMilliseconds / 1000)
+            .round();
     if (seconds < 60) return '$seconds dtk terakhir';
     return '${(seconds / 60).toStringAsFixed(seconds % 60 == 0 ? 0 : 1)} menit terakhir';
   }
 
-  Future<void> _enableNotifications() async {
+  Future<void> _toggleNotifications() async {
     if (_requestingNotifications) return;
+
+    // Sudah aktif -> matikan peringatan
+    if (_notificationsEnabled) {
+      setState(() => _notificationsEnabled = false);
+      _showSnack('Notifikasi kebisingan dimatikan.');
+      return;
+    }
 
     setState(() => _requestingNotifications = true);
     final result = await FirebaseNotificationService.enableNotifications();
@@ -207,27 +236,38 @@ class _SoundDashboardPageState extends State<SoundDashboardPage> {
     setState(() {
       _requestingNotifications = false;
       _notificationsEnabled = result == NotificationPermissionResult.enabled;
+      if (_notificationsEnabled) {
+        _wasLoud = false;
+        _lastAlertAt = null;
+      }
     });
 
     final message = switch (result) {
       NotificationPermissionResult.enabled =>
-        'Notifikasi kebisingan berhasil diaktifkan.',
+        'Notifikasi aktif. Anda akan diberi tahu saat suara melewati 85 dB.',
       NotificationPermissionResult.denied =>
-        'Izin notifikasi belum diberikan. Periksa pengaturan perangkat.',
-      NotificationPermissionResult.notConfigured =>
-        'Firebase belum dikonfigurasi. Ikuti panduan di README.md.',
+        'Izin notifikasi ditolak. Aktifkan lewat Pengaturan > Aplikasi > LoudSound > Notifikasi.',
       NotificationPermissionResult.unsupportedPlatform =>
-        'Notifikasi Firebase tersedia di platform Android dan iOS.',
+        'Notifikasi tersedia di platform Android dan iOS.',
     };
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(message)),
-    );
+    _showSnack(message);
+
+    if (result == NotificationPermissionResult.enabled) {
+      await FirebaseNotificationService.showActivatedNotification();
+    }
+  }
+
+  void _showSnack(String message) {
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(message)));
   }
 
   @override
   Widget build(BuildContext context) {
-    final db = _shownDb;
-    final rms = _shownRms;
+    // Nilai langsung dari service (realtime, tanpa batching timer)
+    final db = _paired ? _bleService.latestDecibels : null;
+    final rms = _paired ? _bleService.latestRms : null;
     final level = db == null ? null : NoiseLevel.fromDb(db);
     final deviceName = _bleService.currentDeviceName;
 
@@ -258,7 +298,7 @@ class _SoundDashboardPageState extends State<SoundDashboardPage> {
                               isMock: _bleService.isMockDevice,
                               notificationsEnabled: _notificationsEnabled,
                               isLoadingNotifications: _requestingNotifications,
-                              onNotificationsPressed: _enableNotifications,
+                              onNotificationsPressed: _toggleNotifications,
                               onDevicePressed: () =>
                                   BleProvisioningSheet.show(context),
                               onToggleDemo: () {
@@ -270,7 +310,7 @@ class _SoundDashboardPageState extends State<SoundDashboardPage> {
                               },
                             ),
 
-                            // 2. CENTERPIECE HERO: Angka DB / RMS di Tengah Layar (Refresh Tiap 2 Detik)
+                            // 2. CENTERPIECE HERO: Angka dB / RMS di Tengah Layar (Realtime)
                             Expanded(
                               child: Center(
                                 child: HeroReading(
@@ -280,15 +320,15 @@ class _SoundDashboardPageState extends State<SoundDashboardPage> {
                                   onUnitChanged: (value) =>
                                       setState(() => _unit = value),
                                   status: _heroStatus,
-                                  refreshSeconds: 2,
-                                  iotStatus: _bleService.latestStatus,
+                                  iotStatus:
+                                      _paired ? _bleService.latestStatus : null,
                                 ),
                               ),
                             ),
 
-                            // 3. BOTTOM SECTION: Meter Audio VU (Realtime 1s) & Statistik Ringkas (2s)
+                            // 3. BOTTOM SECTION: Meter Audio VU & Statistik Ringkas (Realtime)
                             _BottomSection(
-                              barDb: _barDb,
+                              barDb: db,
                               db: db,
                               rms: rms,
                               history: _history,
@@ -443,7 +483,7 @@ class _DashboardTopBar extends StatelessWidget {
           IconButton(
             tooltip: paired && isMock
                 ? 'Putuskan demo'
-                : 'Uji simulasi 2s refresh',
+                : 'Uji simulasi realtime',
             onPressed: onToggleDemo,
             style: IconButton.styleFrom(
               fixedSize: const Size(36, 36),
@@ -460,7 +500,7 @@ class _DashboardTopBar extends StatelessWidget {
           // Tombol Notifikasi
           IconButton(
             tooltip: notificationsEnabled
-                ? 'Notifikasi aktif'
+                ? 'Matikan notifikasi'
                 : 'Aktifkan notifikasi',
             onPressed: onNotificationsPressed,
             style: IconButton.styleFrom(
@@ -520,11 +560,11 @@ class _BottomSection extends StatelessWidget {
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        // Visualizer Audio VU Meter (Realtime 1 detik dari kiri ke kanan)
+        // Visualizer Audio VU Meter (Realtime, tanpa animasi tween)
         LevelMeter(db: barDb),
         const SizedBox(height: 18),
 
-        // 3 Metrik Esensial: Puncak, Rata-rata, dan Parameter Alternatif (Refresh 2 detik)
+        // 3 Metrik Esensial: Puncak, Rata-rata, dan Parameter Alternatif
         StatsRow(
           history: history,
           unit: unit,

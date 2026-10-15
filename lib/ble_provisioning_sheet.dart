@@ -28,6 +28,7 @@ class _BleProvisioningSheetState extends State<BleProvisioningSheet> {
 
   bool _obscurePassword = true;
   bool _isSendingWifi = false;
+  bool _awaitingWifiResult = false;
   String? _feedback;
   bool _feedbackIsError = false;
 
@@ -53,7 +54,22 @@ class _BleProvisioningSheetState extends State<BleProvisioningSheet> {
   }
 
   void _onBleUpdate() {
-    if (mounted) setState(() {});
+    if (!mounted) return;
+
+    // Ikuti hasil koneksi Wi-Fi yang dilaporkan ESP32 via BLE
+    if (_awaitingWifiResult) {
+      final status = _bleService.iotWifiStatus;
+      if (status.startsWith('Tersambung')) {
+        _awaitingWifiResult = false;
+        _feedback = 'Wi-Fi berhasil: $status';
+        _feedbackIsError = false;
+      } else if (status.startsWith('Gagal')) {
+        _awaitingWifiResult = false;
+        _feedback = status;
+        _feedbackIsError = true;
+      }
+    }
+    setState(() {});
   }
 
   void _setFeedback(String message, {bool error = false}) {
@@ -70,7 +86,10 @@ class _BleProvisioningSheetState extends State<BleProvisioningSheet> {
     if (success) {
       _setFeedback('Terhubung ke ${item.name}.');
     } else {
-      _setFeedback('Gagal menghubungkan ke ${item.name}.', error: true);
+      _setFeedback(
+        _bleService.lastError ?? 'Gagal menghubungkan ke ${item.name}.',
+        error: true,
+      );
     }
   }
 
@@ -85,6 +104,7 @@ class _BleProvisioningSheetState extends State<BleProvisioningSheet> {
 
     setState(() {
       _isSendingWifi = true;
+      _awaitingWifiResult = false;
       _feedback = null;
     });
     final success = await _bleService.sendWifiCredentials(
@@ -95,9 +115,13 @@ class _BleProvisioningSheetState extends State<BleProvisioningSheet> {
     setState(() => _isSendingWifi = false);
 
     if (success) {
-      _setFeedback('Kredensial Wi-Fi terkirim. Menunggu perangkat tersambung…');
+      _awaitingWifiResult = true;
+      _setFeedback('Kredensial terkirim. Menunggu ESP32 tersambung ke Wi-Fi…');
     } else {
-      _setFeedback('Gagal mengirim kredensial melalui BLE.', error: true);
+      _setFeedback(
+        _bleService.lastError ?? 'Gagal mengirim kredensial melalui BLE.',
+        error: true,
+      );
     }
   }
 
@@ -235,7 +259,9 @@ class _BleProvisioningSheetState extends State<BleProvisioningSheet> {
                 const SizedBox(height: 3),
                 Text(
                   connected
-                      ? 'Wi-Fi: ${_bleService.iotWifiStatus}'
+                      ? ((!_bleService.isMockDevice && !_bleService.hasTelemetry)
+                          ? 'Terhubung, tetapi data suara tidak ditemukan. Pastikan firmware ESP32 terbaru.'
+                          : 'Wi-Fi: ${_bleService.iotWifiStatus}')
                       : 'Pindai lalu pilih perangkat di bawah',
                   maxLines: 2,
                   overflow: TextOverflow.ellipsis,
@@ -351,10 +377,17 @@ class _BleProvisioningSheetState extends State<BleProvisioningSheet> {
                   ),
                 ),
                 const SizedBox(height: 4),
-                const Text(
-                  'Pastikan Bluetooth aktif dan perangkat dalam mode pairing.',
+                Text(
+                  _bleService.lastError ??
+                      'Pastikan Bluetooth aktif dan ESP32 menyala (nama: Noise_Monitor).',
                   textAlign: TextAlign.center,
-                  style: TextStyle(color: AppColors.textMuted, fontSize: 12),
+                  style: TextStyle(
+                    color: _bleService.lastError != null
+                        ? AppColors.loud
+                        : AppColors.textMuted,
+                    fontSize: 12,
+                    height: 1.4,
+                  ),
                 ),
                 const SizedBox(height: 14),
                 OutlinedButton.icon(
@@ -363,7 +396,7 @@ class _BleProvisioningSheetState extends State<BleProvisioningSheet> {
                     Navigator.of(context).pop();
                   },
                   icon: const Icon(Icons.bolt_rounded, size: 16, color: AppColors.quiet),
-                  label: const Text('Pair Perangkat Demo (Tes Refresh 2 Detik)'),
+                  label: const Text('Pair Perangkat Demo'),
                   style: OutlinedButton.styleFrom(
                     foregroundColor: AppColors.textPrimary,
                     side: const BorderSide(color: AppColors.borderStrong),
@@ -503,7 +536,8 @@ class _BleProvisioningSheetState extends State<BleProvisioningSheet> {
   }
 
   Widget _buildWifiSection(bool connected) {
-    final canSend = connected && !_isSendingWifi;
+    final supported = _bleService.supportsWifiProvisioning;
+    final canSend = connected && supported && !_isSendingWifi;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -576,6 +610,14 @@ class _BleProvisioningSheetState extends State<BleProvisioningSheet> {
           const Text(
             'Hubungkan perangkat via Bluetooth terlebih dahulu.',
             style: TextStyle(color: AppColors.normal, fontSize: 12),
+          ),
+        ] else if (!supported) ...[
+          const SizedBox(height: 12),
+          Text(
+            _bleService.isMockDevice
+                ? 'Mode demo tidak mendukung pengaturan Wi-Fi.'
+                : 'Firmware ESP32 belum mendukung pengaturan Wi-Fi. Flash ulang DETEKSI_KEBISINGAN_IOT.ino versi terbaru.',
+            style: const TextStyle(color: AppColors.normal, fontSize: 12),
           ),
         ],
       ],

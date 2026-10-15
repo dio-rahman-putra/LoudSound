@@ -19,21 +19,17 @@ class SoundReading {
 
 ({String value, String unit}) formatValue(
   double v,
-  SoundUnit unit, {
-  bool? milli,
-}) {
+  SoundUnit unit,
+) {
   if (unit == SoundUnit.db) {
     return (value: v.toStringAsFixed(1), unit: 'dB');
   }
-  // Skala RMS dari perangkat ESP32 (DETEKSI_KEBISINGAN_IOT.ino, misal 70 - 130)
-  if (v >= 10.0) {
-    return (value: v.toStringAsFixed(1), unit: 'RMS');
+  // RMS = tekanan suara terkalibrasi (Pascal) yang diturunkan dari dB SPL:
+  // p = 20 µPa × 10^(dB/20)  ->  94 dB SPL = 1 Pa.
+  if (v >= 1.0) {
+    return (value: v.toStringAsFixed(2), unit: 'Pa');
   }
-  final useMilli = milli ?? v < 0.01;
-  if (useMilli) {
-    return (value: (v * 1000).toStringAsFixed(1), unit: 'mV');
-  }
-  return (value: v.toStringAsFixed(3), unit: 'V');
+  return (value: (v * 1000).toStringAsFixed(v >= 0.01 ? 1 : 2), unit: 'mPa');
 }
 
 /// Bagian utama: angka di tengah layar dengan sorotan cahaya halus (spotlight),
@@ -46,7 +42,6 @@ class HeroReading extends StatelessWidget {
     required this.unit,
     required this.onUnitChanged,
     required this.status,
-    required this.refreshSeconds,
     this.iotStatus,
   });
 
@@ -55,7 +50,6 @@ class HeroReading extends StatelessWidget {
   final SoundUnit unit;
   final ValueChanged<SoundUnit> onUnitChanged;
   final HeroStatus status;
-  final int refreshSeconds;
   final String? iotStatus;
 
   @override
@@ -136,10 +130,8 @@ class HeroReading extends StatelessWidget {
               value == null
                   ? (unit == SoundUnit.db ? 'DECIBEL' : 'RMS')
                   : (unit == SoundUnit.db
-                      ? 'DECIBEL (dB)'
-                      : (value >= 10.0
-                          ? 'AMPLITUDO SUARA (RMS)'
-                          : formatValue(value, unit).unit.toUpperCase())),
+                      ? 'DECIBEL (dB SPL)'
+                      : 'TEKANAN SUARA · RMS (${formatValue(value, unit).unit})'),
               style: const TextStyle(
                 color: AppColors.textSecondary,
                 fontSize: 12.5,
@@ -213,8 +205,8 @@ class HeroReading extends StatelessWidget {
             ),
             const SizedBox(height: 14),
 
-            // 6. Indikator Siklus Refresh 2 Detik
-            _LiveIndicator(status: status, refreshSeconds: refreshSeconds),
+            // 6. Indikator Realtime
+            _LiveIndicator(status: status),
           ],
         ),
       ),
@@ -244,29 +236,22 @@ class _AnimatedReading extends StatelessWidget {
       );
     }
 
-    final milli = unit == SoundUnit.rms && target < 0.01;
-
+    // Tanpa TweenAnimationBuilder: angka langsung berubah mengikuti data
+    // sehingga tidak menambah delay tampilan.
     return FittedBox(
       fit: BoxFit.scaleDown,
-      child: TweenAnimationBuilder<double>(
-        key: ValueKey(unit),
-        tween: Tween<double>(end: target),
-        duration: const Duration(milliseconds: 650),
-        curve: Curves.easeOutCubic,
-        builder: (context, animated, _) => Text(
-          formatValue(animated, unit, milli: milli).value,
-          style: AppText.number(_size, weight: FontWeight.w200),
-        ),
+      child: Text(
+        formatValue(target, unit).value,
+        style: AppText.number(_size, weight: FontWeight.w200),
       ),
     );
   }
 }
 
 class _LiveIndicator extends StatefulWidget {
-  const _LiveIndicator({required this.status, required this.refreshSeconds});
+  const _LiveIndicator({required this.status});
 
   final HeroStatus status;
-  final int refreshSeconds;
 
   @override
   State<_LiveIndicator> createState() => _LiveIndicatorState();
@@ -300,11 +285,11 @@ class _LiveIndicatorState extends State<_LiveIndicator>
     if (status == HeroStatus.offline) {
       label = 'OFFLINE · DEVICE BELUM KE-PAIR';
     } else if (status == HeroStatus.waiting) {
-      label = 'TERHUBUNG · MENYINKRONKAN SETIAP ${widget.refreshSeconds} DETIK';
+      label = 'TERHUBUNG · MENYINKRONKAN DATA';
     } else if (status == HeroStatus.stale) {
       label = 'DATA TERTUNDA · MENUNGGU SAMBUNGAN IOT';
     } else {
-      label = 'LIVE · REFRESH TIAP ${widget.refreshSeconds} DETIK';
+      label = 'LIVE · REALTIME';
     }
 
     return Row(
@@ -377,7 +362,7 @@ class UnitSelectorPill extends StatelessWidget {
         mainAxisSize: MainAxisSize.min,
         children: [
           _option('dB (Desibel)', SoundUnit.db),
-          _option('RMS (Volt)', SoundUnit.rms),
+          _option('RMS (Pascal)', SoundUnit.rms),
         ],
       ),
     );
@@ -435,19 +420,13 @@ class LevelMeter extends StatelessWidget {
         ? 0.0
         : ((value - minDb) / (maxDb - minDb)).clamp(0.0, 1.0);
 
-    return TweenAnimationBuilder<double>(
-      tween: Tween<double>(end: fraction),
-      duration: const Duration(milliseconds: 400),
-      curve: Curves.easeOutQuad,
-      builder: (context, animated, _) {
-        return SizedBox(
-          height: 48,
-          width: double.infinity,
-          child: CustomPaint(
-            painter: _MeterPainter(fraction: animated, active: value != null),
-          ),
-        );
-      },
+    // Tanpa animasi tween: bar langsung mengikuti data terbaru.
+    return SizedBox(
+      height: 48,
+      width: double.infinity,
+      child: CustomPaint(
+        painter: _MeterPainter(fraction: fraction, active: value != null),
+      ),
     );
   }
 }

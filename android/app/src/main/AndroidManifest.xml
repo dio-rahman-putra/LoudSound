@@ -7,6 +7,10 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <!-- Android 13+: akses perangkat Wi-Fi sekitar TANPA izin lokasi -->
+    <uses-permission
+        android:name="android.permission.NEARBY_WIFI_DEVICES"
+        android:usesPermissionFlags="neverForLocation" />
 
     <!-- BLE hardware feature -->
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
@@ -14,11 +18,17 @@
     <!-- Legacy Bluetooth permissions for Android 11 and lower -->
     <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
-    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
-    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <!-- Lokasi HANYA dibutuhkan sistem Android 11 ke bawah untuk scan BLE.
+         Di Android 12+ tidak diminta sama sekali (GPS tidak perlu menyala). -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" android:maxSdkVersion="30" />
 
-    <!-- Bluetooth permissions for Android 12+ -->
-    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
+    <!-- Bluetooth permissions for Android 12+ ("Perangkat sekitar") -->
+    <!-- neverForLocation: scan BLE tidak dipakai untuk menentukan lokasi,
+         sehingga izin lokasi & GPS TIDAK diperlukan. -->
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
 
     <application

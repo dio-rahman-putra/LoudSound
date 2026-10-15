@@ -1,8 +1,7 @@
 # LoudSound
 
-Dashboard Flutter satu halaman untuk menampilkan tingkat suara dalam desibel
-dan kategori kebisingan. Tampilan saat ini adalah UI awal; belum membaca
-mikrofon atau terhubung ke perangkat IoT.
+Dashboard Flutter satu halaman untuk menampilkan tingkat suara (dB SPL)
+realtime dari perangkat IoT ESP32 (mikrofon INMP441) melalui Bluetooth LE.
 
 ## Menjalankan aplikasi
 
@@ -11,46 +10,37 @@ flutter pub get
 flutter run
 ```
 
-## Menyiapkan notifikasi Firebase
+## Notifikasi kebisingan
 
-Notifikasi push menggunakan Firebase Cloud Messaging (FCM) dan ditujukan untuk
-Android/iOS. Kredensial Firebase tidak disertakan di project.
+Tekan ikon lonceng di aplikasi untuk mengaktifkan notifikasi. Aplikasi membuat
+notifikasi **lokal** begitu data BLE menunjukkan suara melewati 85 dB (diulang
+tiap 30 detik selama masih berisik). Fitur ini tidak memerlukan Firebase. Untuk
+Android 13+ izin notifikasi akan diminta saat lonceng ditekan.
 
-1. Buat project di [Firebase Console](https://console.firebase.google.com/) dan
-   daftarkan aplikasi Android dengan application ID
-   `com.example.iot_loud_sound`.
-2. Pasang Firebase CLI dan FlutterFire CLI, lalu login:
+Notifikasi berjalan selama aplikasi masih hidup (foreground/background).
+Untuk notifikasi saat aplikasi benar-benar tertutup diperlukan backend FCM.
 
-   ```bash
-   npm install -g firebase-tools
-   firebase login
-   dart pub global activate flutterfire_cli
-   ```
+## Izin Android
 
-3. Dari folder project jalankan:
+- Android 12+: hanya "Perangkat sekitar" (Bluetooth scan/connect + Wi-Fi).
+  Lokasi/GPS **tidak** diperlukan (`neverForLocation`).
+- Android 11 ke bawah: sistem Android mewajibkan izin lokasi untuk scan BLE.
 
-   ```bash
-   flutterfire configure
-   ```
+## Protokol BLE (DETEKSI_KEBISINGAN_IOT.ino)
 
-   Pilih project Firebase dan platform Android/iOS. Perintah ini akan mengisi
-   `lib/firebase_options.dart`; ganti application ID di
-   `android/app/build.gradle.kts` terlebih dahulu bila Anda memakai ID sendiri.
-4. Untuk iOS, aktifkan Push Notifications dan Background Modes > Remote
-   notifications di Xcode, lalu unggah APNs authentication key ke pengaturan
-   Cloud Messaging di Firebase Console.
-5. Jalankan aplikasi di perangkat Android/iOS, lalu tekan ikon lonceng dan
-   izinkan notifikasi. Aplikasi akan berlangganan topic FCM `noise-alerts`.
+Service `4fa8c001-124e-423a-bc3f-923de9dc001e`:
 
-Foreground notification Android ditampilkan melalui notification channel
-`Peringatan kebisingan`. Untuk mengirim peringatan saat sensor mendeteksi suara
-berisik, backend/IoT harus mengirim pesan FCM ke topic `noise-alerts` melalui
-Firebase Admin SDK. Jangan menaruh service-account key di aplikasi Flutter.
+| Characteristic | UUID (akhiran) | Sifat | Isi |
+| --- | --- | --- | --- |
+| Telemetri | `...26a8` | Read/Notify | `{"db":74.3,"rms":0.01234,"status":"NORMAL"}` |
+| Konfigurasi Wi-Fi | `...26b1` | Write | `{"ssid":"...","password":"..."}` |
+| Status Wi-Fi | `...26b2` | Read/Notify | teks status koneksi |
 
-## Titik integrasi IoT
-
-Callback `onIoTDataReceived` di
-`lib/main.dart` disiapkan sebagai titik masuk data sensor. Hubungkan callback
-tersebut ke stream/peristiwa dari perangkat, lalu perbarui nilai desibel dan
-pemetaan kategori `Pelan`, `Normal`, atau `Berisik` sesuai ambang yang
-digunakan perangkat.
+- `db` = dB SPL terkalibrasi (INMP441: -26 dBFS @ 94 dB SPL), `rms` = tekanan
+  suara dalam Pascal.
+- Telemetri dikirim tiap 250 ms (realtime). Alarm/buzzer/Serial tetap dievaluasi
+  tiap 2 detik di alat.
+- Kalibrasi manual: atur `CAL_OFFSET_DB` di firmware dengan membandingkan ke
+  sound level meter referensi.
+- Firmware memanggil `BLEDevice::setMTU(247)`; tanpa itu payload terpotong 20
+  byte dan data tidak terbaca di aplikasi.

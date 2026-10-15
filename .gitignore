@@ -1,0 +1,130 @@
+# ==============================================================================
+# SENSITIVE CREDENTIALS & SECRETS (JANGAN DI-PUSH!)
+# ==============================================================================
+# Google Services & Firebase
+**/google-services.json
+**/GoogleService-Info.plist
+**/firebase_app_id_file.json
+*firebase*.json
+*service-account*.json
+
+# Environment Variables & API Keys
+.env
+.env.*
+*.env
+!.env.example
+credentials.json
+secrets.json
+secrets.yaml
+secrets.properties
+
+# Android Keystores & Signing Keys
+*.keystore
+*.jks
+*.key
+*.p12
+*.pfx
+*.pem
+*.pkcs12
+**/android/local.properties
+**/android/key.properties
+key.properties
+local.properties
+
+# iOS Certificates & Provisioning Profiles
+*.mobileprovision
+*.cer
+*.p8
+
+# ==============================================================================
+# FLUTTER & DART BUILD ARTIFACTS
+# ==============================================================================
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub-cache/
+.pub/
+/build/
+**/build/
+/coverage/
+**/doc/api/
+
+# Symbolication & Obfuscation
+app.*.symbols
+app.*.map.json
+
+# ==============================================================================
+# ANDROID BUILD ARTIFACTS
+# ==============================================================================
+.gradle/
+**/android/.gradle/
+**/android/captures/
+**/android/app/debug
+**/android/app/profile
+**/android/app/release
+**/.cxx/
+**/GeneratedPluginRegistrant.java
+
+# ==============================================================================
+# IOS BUILD ARTIFACTS
+# ==============================================================================
+**/ios/Flutter/.last_build_id
+**/ios/Flutter/Generated.xcconfig
+**/ios/Flutter/flutter_export_environment.sh
+**/ios/Flutter/ephemeral/
+**/ios/Flutter/flutter_assets/
+**/ios/Runner/GeneratedPluginRegistrant.*
+**/ios/Pods/
+**/ios/.symlinks/
+**/DerivedData/
+**/xcuserdata/
+
+# ==============================================================================
+# IOT / ARDUINO / EMBEDDED BUILD ARTIFACTS
+# ==============================================================================
+*.hex
+*.bin
+*.elf
+*.eep
+*.o
+*.a
+*.d
+arduino_build_*
+arduino_cache_*
+
+# ==============================================================================
+# IDE & EDITOR FILES
+# ==============================================================================
+# IntelliJ / Android Studio
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# Visual Studio Code (kecuali file rekomendasi & konfigurasi shareable)
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# ==============================================================================
+# OS & MISCELLANEOUS
+# ==============================================================================
+.DS_Store
+Thumbs.db
+ehthumbs.db
+desktop.ini
+*.class
+*.log
+*.pyc
+*.swp
+*~
+*.bak
+*.tmp
+.history/
+.atom/
+.svn/
+.swiftpm/
+migrate_working_dir/
